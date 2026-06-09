@@ -867,6 +867,10 @@ pub fn run() {
                 } else {
                     log::warn!("Failed to load macOS tray icon for tray");
                 }
+
+                if let Some(title) = crate::tray::compute_macos_tray_title(&app_state) {
+                    tray_builder = tray_builder.title(title);
+                }
             }
 
             #[cfg(not(target_os = "macos"))]
@@ -879,6 +883,12 @@ pub fn run() {
             }
 
             let _tray = tray_builder.build(app)?;
+            {
+                let app_handle = app.handle().clone();
+                tauri::async_runtime::spawn(async move {
+                    crate::tray::refresh_all_usage_in_tray(&app_handle).await;
+                });
+            }
             crate::services::webdav_auto_sync::start_worker(
                 app_state.db.clone(),
                 app.handle().clone(),

@@ -197,6 +197,14 @@ fn tier_pct(data: &crate::provider::UsageData) -> Option<f64> {
     }
 }
 
+fn format_balance_value(value: f64) -> String {
+    if (value.fract()).abs() < 0.005 {
+        format!("{value:.0}")
+    } else {
+        format!("{value:.2}")
+    }
+}
+
 fn format_script_summary(result: &crate::provider::UsageResult) -> Option<String> {
     if !result.success {
         return None;
@@ -230,14 +238,114 @@ fn format_script_summary(result: &crate::provider::UsageResult) -> Option<String
     }
 
     let first = data.first()?;
-    let pct = tier_pct(first)?;
-    let emoji = emoji_for_utilization(pct);
-    let plan = first.plan_name.as_deref().unwrap_or("");
-    let rounded = pct.round() as i64;
-    if plan.is_empty() {
-        Some(format!("{} {}%", emoji, rounded))
-    } else {
-        Some(format!("{} {} {}%", emoji, plan, rounded))
+    if let Some(pct) = tier_pct(first) {
+        let emoji = emoji_for_utilization(pct);
+        let plan = first.plan_name.as_deref().unwrap_or("");
+        let rounded = pct.round() as i64;
+        if plan.is_empty() {
+            return Some(format!("{} {}%", emoji, rounded));
+        } else {
+            return Some(format!("{} {} {}%", emoji, plan, rounded));
+        }
+    }
+
+    if let Some(remaining) = first.remaining.filter(|value| value.is_finite()) {
+        let amount = format_balance_value(remaining);
+        let unit = first.unit.as_deref().unwrap_or("").trim();
+        let plan = first.plan_name.as_deref().unwrap_or("").trim();
+        let body = if unit.is_empty() {
+            amount
+        } else {
+            format!("{amount} {unit}")
+        };
+        if plan.is_empty() {
+            return Some(format!("\u{1F4B0} {body}"));
+        } else {
+            return Some(format!("\u{1F4B0} {plan} {body}"));
+        }
+    }
+
+    None
+}
+
+fn summary_to_menubar_text(summary: &str) -> String {
+    summary
+        .chars()
+        .filter(|ch| !matches!(ch, '🟢' | '🟠' | '🔴' | '💰'))
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+#[cfg(target_os = "macos")]
+fn format_macos_tray_title(
+    app_state: &AppState,
+    section: &TrayAppSection,
+    provider: &crate::provider::Provider,
+    provider_id: &str,
+) -> Option<String> {
+    let suffix = format_usage_suffix(app_state, &section.app_type, provider, provider_id)?;
+    let summary = suffix
+        .strip_prefix(" · ")
+        .unwrap_or_default()
+        .trim();
+    if summary.is_empty() {
+        return None;
+    }
+
+    let compact = summary_to_menubar_text(summary);
+    if compact.is_empty() {
+        return None;
+    }
+
+    Some(compact)
+}
+
+#[cfg(target_os = "macos")]
+fn current_provider_for_section(
+    app_state: &AppState,
+    section: &TrayAppSection,
+) -> Option<(String, crate::provider::Provider)> {
+    let current_id =
+        crate::settings::get_effective_current_provider(&app_state.db, &section.app_type)
+            .ok()
+            .flatten()?;
+    let provider = app_state
+        .db
+        .get_provider_by_id(&current_id, section.app_type.as_str())
+        .ok()
+        .flatten()?;
+    Some((current_id, provider))
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) fn compute_macos_tray_title(app_state: &AppState) -> Option<String> {
+    let visible_apps = crate::settings::get_settings()
+        .visible_apps
+        .unwrap_or_default();
+
+    TRAY_SECTIONS
+        .iter()
+        .filter(|section| visible_apps.is_visible(&section.app_type))
+        .find_map(|section| {
+            let (provider_id, provider) = current_provider_for_section(app_state, section)?;
+            format_macos_tray_title(app_state, section, &provider, &provider_id)
+        })
+}
+
+#[cfg(target_os = "macos")]
+pub fn sync_macos_tray_title(app: &tauri::AppHandle) {
+    let Some(app_state) = app.try_state::<AppState>() else {
+        return;
+    };
+    let Some(tray) = app.tray_by_id(TRAY_ID) else {
+        return;
+    };
+
+    let title = compute_macos_tray_title(app_state.inner());
+    if let Err(e) = tray.set_title(title.as_deref()) {
+        log::debug!("[Tray] 更新 macOS 标题失败: {e}");
     }
 }
 
@@ -660,6 +768,9 @@ fn update_tray_usage_labels(app: &tauri::AppHandle) {
             log::debug!("[Tray] 更新{}子菜单标题失败: {e}", section.log_name);
         }
     }
+
+    #[cfg(target_os = "macos")]
+    sync_macos_tray_title(app);
 }
 
 pub fn refresh_tray_menu(app: &tauri::AppHandle) {
@@ -670,6 +781,10 @@ pub fn refresh_tray_menu(app: &tauri::AppHandle) {
             if let Some(tray) = app.tray_by_id(TRAY_ID) {
                 if let Err(e) = tray.set_menu(Some(new_menu)) {
                     log::error!("刷新托盘菜单失败: {e}");
+                }
+                #[cfg(target_os = "macos")]
+                if let Err(e) = tray.set_title(compute_macos_tray_title(state.inner()).as_deref()) {
+                    log::debug!("[Tray] 刷新 macOS 标题失败: {e}");
                 }
             }
         }
@@ -784,6 +899,7 @@ pub fn schedule_tray_refresh(app: &tauri::AppHandle) {
 /// `TRAY_SECTIONS.len()` 次外部请求；只有显式启用的用量查询（含官方订阅、
 /// coding_plan / balance / Copilot / 自定义脚本）才会发请求。
 pub(crate) async fn refresh_all_usage_in_tray(app: &tauri::AppHandle) {
+    use crate::commands::CodexOAuthState;
     use crate::commands::CopilotAuthState;
     use futures::future::join_all;
 
@@ -851,6 +967,7 @@ pub(crate) async fn refresh_all_usage_in_tray(app: &tauri::AppHandle) {
             let app_clone = app.clone();
             let state = app.state::<AppState>();
             let copilot_state = app.state::<CopilotAuthState>();
+            let codex_oauth_state = app.state::<CodexOAuthState>();
             let provider_id = current_id.clone();
             let app_str = app_type_str.to_string();
             script_futures.push(async move {
@@ -858,6 +975,7 @@ pub(crate) async fn refresh_all_usage_in_tray(app: &tauri::AppHandle) {
                     app_clone,
                     state,
                     copilot_state,
+                    codex_oauth_state,
                     provider_id.clone(),
                     app_str,
                 )
@@ -874,7 +992,9 @@ pub(crate) async fn refresh_all_usage_in_tray(app: &tauri::AppHandle) {
 
 #[cfg(test)]
 mod tests {
-    use super::{format_script_summary, format_subscription_summary, TRAY_ID};
+    use super::{
+        format_script_summary, format_subscription_summary, summary_to_menubar_text, TRAY_ID,
+    };
     use crate::provider::{UsageData, UsageResult};
     use crate::services::subscription::{
         CredentialStatus, QuotaTier, SubscriptionQuota, TIER_FIVE_HOUR, TIER_GEMINI_FLASH,
@@ -1176,5 +1296,32 @@ mod tests {
     fn script_summary_empty_data_returns_none() {
         let r = usage_result(true, vec![]);
         assert!(format_script_summary(&r).is_none());
+    }
+
+    #[test]
+    fn script_summary_balance_fallback_uses_remaining_and_unit() {
+        let r = UsageResult {
+            success: true,
+            data: Some(vec![UsageData {
+                plan_name: Some("ADDCN".to_string()),
+                extra: None,
+                is_valid: Some(true),
+                invalid_message: None,
+                total: None,
+                used: None,
+                remaining: Some(784.4),
+                unit: Some("USD".to_string()),
+            }]),
+            error: None,
+        };
+        let s = format_script_summary(&r).expect("should format");
+        assert_eq!(s, "\u{1F4B0} ADDCN 784.40 USD");
+    }
+
+    #[test]
+    fn menubar_text_strips_status_emoji_and_normalizes_spacing() {
+        assert_eq!(summary_to_menubar_text("🟠 h12%   w80%"), "h12% w80%");
+        assert_eq!(summary_to_menubar_text("🔴 15%"), "15%");
+        assert_eq!(summary_to_menubar_text("💰 ADDCN 784.40 USD"), "ADDCN 784.40 USD");
     }
 }

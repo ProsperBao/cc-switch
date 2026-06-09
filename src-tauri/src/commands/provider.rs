@@ -2,6 +2,7 @@ use indexmap::IndexMap;
 use tauri::{Emitter, State};
 
 use crate::app_config::AppType;
+use crate::commands::CodexOAuthState;
 use crate::commands::copilot::CopilotAuthState;
 use crate::error::AppError;
 use crate::provider::{ClaudeDesktopMode, Provider};
@@ -376,6 +377,7 @@ pub async fn queryProviderUsage(
     app_handle: tauri::AppHandle,
     state: State<'_, AppState>,
     copilot_state: State<'_, CopilotAuthState>,
+    codex_oauth_state: State<'_, CodexOAuthState>,
     #[allow(non_snake_case)] providerId: String, // 使用 camelCase 匹配前端
     app: String,
 ) -> Result<crate::provider::UsageResult, String> {
@@ -386,8 +388,14 @@ pub async fn queryProviderUsage(
     // 两种都要把"失败"写进 UsageCache 并刷新托盘，让 format_script_summary 的
     // success 守卫生效、suffix 自然消失，避免旧 success 快照长期滞留。
     // 同时保持原始 Err 返回给前端 React Query 的 onError 回调，不吞错误。
-    let inner =
-        query_provider_usage_inner(&state, &copilot_state, app_type.clone(), &providerId).await;
+    let inner = query_provider_usage_inner(
+        &state,
+        &copilot_state,
+        &codex_oauth_state,
+        app_type.clone(),
+        &providerId,
+    )
+    .await;
     let snapshot = match &inner {
         Ok(r) => r.clone(),
         Err(err_msg) => crate::provider::UsageResult {
@@ -457,6 +465,7 @@ fn resolve_coding_plan_credentials(
 async fn query_provider_usage_inner(
     state: &AppState,
     copilot_state: &CopilotAuthState,
+    codex_oauth_state: &CodexOAuthState,
     app_type: AppType,
     provider_id: &str,
 ) -> Result<crate::provider::UsageResult, String> {
@@ -607,9 +616,41 @@ async fn query_provider_usage_inner(
             });
         }
 
-        let quota = crate::services::subscription::get_subscription_quota(app_type.as_str())
+        let quota = if provider.is_some_and(|p| p.is_codex_oauth()) {
+            let account_id = provider
+                .and_then(|p| p.meta.as_ref())
+                .and_then(|m| m.managed_account_id_for("codex_oauth"));
+            let manager = codex_oauth_state.0.read().await;
+            let resolved_account_id = match account_id {
+                Some(id) => Some(id),
+                None => manager.default_account_id().await,
+            };
+
+            let Some(account_id) = resolved_account_id else {
+                return Ok(crate::provider::UsageResult {
+                    success: false,
+                    data: None,
+                    error: Some("No ChatGPT account available".to_string()),
+                });
+            };
+
+            let token = manager
+                .get_valid_token_for_account(&account_id)
+                .await
+                .map_err(|e| format!("Codex OAuth token unavailable: {e}"))?;
+
+            crate::services::subscription::query_codex_quota(
+                &token,
+                Some(&account_id),
+                "codex_oauth",
+                "Codex OAuth access token expired or rejected. Please re-login via cc-switch.",
+            )
             .await
-            .map_err(|e| format!("Failed to query subscription quota: {e}"))?;
+        } else {
+            crate::services::subscription::get_subscription_quota(app_type.as_str())
+                .await
+                .map_err(|e| format!("Failed to query subscription quota: {e}"))?
+        };
 
         if !quota.success {
             return Ok(crate::provider::UsageResult {
